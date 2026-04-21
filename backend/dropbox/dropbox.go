@@ -23,6 +23,7 @@ of path_display and all will be well.
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -291,6 +292,38 @@ Do **not** use this flag when trying to download exportable files - rclone
 will fail to download them.
 `,
 			Advanced: true,
+		}, {
+			Name:    "resume_uploads",
+			Default: false,
+			Help: `Resume interrupted chunked uploads across rclone invocations.
+
+When enabled, rclone persists the Dropbox upload session ID, current
+offset, and a Dropbox content hash of the already-uploaded prefix to
+its cache directory after each uploaded chunk. If the upload is
+interrupted (crash, Ctrl-C, network loss), the next rclone run that
+targets the same destination with the same source continues from
+where it left off instead of starting from byte 0.
+
+On resume, rclone re-hashes the source prefix and verifies it
+matches the saved hash before reusing the session; this catches
+source-content changes that preserve size and mtime. The full-file
+content hash is also sent to UploadSessionFinish so the server
+rejects any assembled-file mismatch.
+
+Dropbox upload sessions eventually expire when idle; the exact window
+is not part of Dropbox's stable contract. If the server reports the
+session is gone, rclone silently falls back to a fresh full upload.
+
+Resume state is keyed by destination path plus source size and
+modification time.
+
+Not compatible with batched uploads (--dropbox-batch-mode); the option
+is silently ignored when batching is active.
+
+Known limitation: the progress bar counts bytes skipped on resume as
+"transferred", so reported totals will exceed the actual wire usage.
+`,
+			Advanced: true,
 		},
 		}...), defaultBatcherOptions.FsOptions("For full info see [the main docs](https://rclone.org/dropbox/#batch-mode)\n\n")...),
 	})
@@ -316,6 +349,7 @@ type Options struct {
 	ExportFormats  fs.CommaSepList      `config:"export_formats"`
 	SkipExports    bool                 `config:"skip_exports"`
 	ShowAllExports bool                 `config:"show_all_exports"`
+	ResumeUploads  bool                 `config:"resume_uploads"`
 }
 
 // Fs represents a remote dropbox server
@@ -459,6 +493,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	err = checkUploadChunkSize(opt.ChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("dropbox: chunk size: %w", err)
+	}
+
+	if opt.ResumeUploads {
+		sweepResumeCache(7 * 24 * time.Hour)
 	}
 
 	// Convert the old token if it exists.  The old token was just
@@ -1931,38 +1969,153 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 // Will introduce two additional network requests to start and finish the session.
 // If the size is unknown (i.e. -1) the method incurs one additional
 // request to the Dropbox API that does not carry a payload to close the append session.
+//
+// When --dropbox-resume-uploads is set and the upload is a regular
+// non-batched chunked upload with known size, it persists the Dropbox upload
+// session ID, current offset, and a Dropbox content hash of the uploaded
+// prefix to rclone's cache directory after each chunk. A subsequent run with
+// the same source+destination fingerprint re-hashes the source prefix and
+// verifies it against the saved value before reusing the session — this
+// catches content changes that preserve size+mtime, which the fingerprint
+// alone cannot detect. Regardless of whether this is a fresh or resumed
+// upload, the full-file Dropbox content hash is passed to
+// UploadSessionFinish so the server rejects any assembled-file mismatch.
 func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *files.CommitInfo, size int64) (entry *files.FileMetadata, err error) {
-	// start upload
-	var res *files.UploadSessionStartResult
-	err = o.fs.pacer.Call(func() (bool, error) {
-		res, err = o.fs.srv.UploadSessionStart(&files.UploadSessionStartArg{}, nil)
-		return shouldRetry(ctx, err)
-	})
-	if err != nil {
-		return nil, err
+	chunkSize := int64(o.fs.opt.ChunkSize)
+	batching := o.fs.batcher.Batching()
+
+	// Resume is only valid for known-size, non-batched, chunked uploads.
+	resumeActive := o.fs.opt.ResumeUploads && !batching && size > chunkSize && commitInfo.ClientModified != nil
+	var (
+		resumed  bool
+		key      string
+		modTime  time.Time
+		destPath string
+	)
+	if resumeActive {
+		modTime = *commitInfo.ClientModified
+		destPath = o.remotePath()
+		key = resumeKey(destPath, size, modTime)
 	}
 
-	chunkSize := int64(o.fs.opt.ChunkSize)
+	var sessionID string
+	var startOffset uint64
+	var savedPrefixHashHex string
+	if resumeActive {
+		if state, ok, lerr := loadResumeState(key); lerr != nil {
+			fs.Debugf(o, "resume: ignoring unreadable state: %v", lerr)
+			_ = deleteResumeState(key)
+		} else if ok && fingerprintMatches(state, size, modTime, destPath) {
+			sessionID = state.SessionID
+			startOffset = state.Offset
+			savedPrefixHashHex = state.PrefixHashHex
+			resumed = true
+			fs.Debugf(o, "resume: reusing session %s at offset %d", sessionID, startOffset)
+		} else if ok {
+			fs.Debugf(o, "resume: discarding state for changed source (saved size=%d modtime=%s, now size=%d modtime=%s)",
+				state.SourceSize, state.SourceModTime, size, modTime)
+			_ = deleteResumeState(key)
+		}
+	}
+
+	if !resumed {
+		var res *files.UploadSessionStartResult
+		err = o.fs.pacer.Call(func() (bool, error) {
+			res, err = o.fs.srv.UploadSessionStart(&files.UploadSessionStartArg{}, nil)
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		sessionID = res.SessionId
+		startOffset = 0
+	}
+
 	chunks, remainder := size/chunkSize, size%chunkSize
 	if remainder > 0 {
 		chunks++
 	}
 
-	// write chunks
-	in := readers.NewCountingReader(in0)
+	// fileHasher streams the full source through Dropbox's content-hash
+	// algorithm as we read. Its mid-stream Sum() gives us the prefix hash to
+	// save alongside resume state; its final Sum() goes into
+	// UploadSessionFinishArg.ContentHash so the server verifies the assembled
+	// file matches our source. dbhash supports multi-Sum, so a single instance
+	// serves both roles.
+	fileHasher := dbhash.New()
+	in := readers.NewCountingReader(io.TeeReader(in0, fileHasher))
+
+	// When resuming, discard the already-uploaded prefix from the CountingReader
+	// (not in0 directly) so both in.BytesRead() and fileHasher reflect the real
+	// session offset before the chunk loop starts. Then verify that the
+	// prefix hash matches what we saved on the prior run — mismatch means the
+	// source content changed while size+mtime stayed constant (e.g. in-place
+	// edits with preserved mtime), which is the one failure mode the
+	// fingerprint can't detect.
+	if resumed && startOffset > 0 {
+		if _, err := io.CopyN(io.Discard, in, int64(startOffset)); err != nil {
+			return nil, fmt.Errorf("resume: skipping source to offset %d: %w", startOffset, err)
+		}
+		gotPrefixHashHex := hex.EncodeToString(fileHasher.Sum(nil))
+		if gotPrefixHashHex != savedPrefixHashHex {
+			fs.Debugf(o, "resume: prefix hash mismatch (saved=%s, recomputed=%s); source changed under preserved size+mtime",
+				savedPrefixHashHex, gotPrefixHashHex)
+			_ = deleteResumeState(key)
+			return nil, fserrors.RetryError(fmt.Errorf("dropbox resume: source prefix hash mismatch, retry from scratch"))
+		}
+	}
+
 	buf := make([]byte, int(chunkSize))
 	cursor := files.UploadSessionCursor{
-		SessionId: res.SessionId,
-		Offset:    0,
+		SessionId: sessionID,
+		Offset:    startOffset,
 	}
 	appendArg := files.UploadSessionAppendArg{Cursor: &cursor}
-	for currentChunk := 1; ; currentChunk++ {
+
+	// firstAppendDone gates the "resumed session appears dead" fallback: if
+	// the very first append attempt after resuming fails (for anything other
+	// than IncorrectOffset, which the inline retry handles), the session has
+	// likely expired or been closed. Delete the cache and return a retriable
+	// error so rclone's outer copy loop re-opens the source and calls Update
+	// again; on that second call there's no cache, so a fresh upload runs.
+	firstAppendDone := false
+
+	// When resumed, continue the visible chunk count from where we left off
+	// instead of restarting at 1, so debug logs reflect reality.
+	startChunk := 1
+	if resumed && chunkSize > 0 {
+		startChunk = int(startOffset/uint64(chunkSize)) + 1
+	}
+	for currentChunk := startChunk; ; currentChunk++ {
 		cursor.Offset = in.BytesRead()
 
 		if chunks < 0 {
 			fs.Debugf(o, "Streaming chunk %d/unknown", currentChunk)
 		} else {
 			fs.Debugf(o, "Uploading chunk %d/%d", currentChunk, chunks)
+		}
+
+		// Persist state *before* sending so a crash between send and save
+		// can't leave us with an offset behind reality. If the save fails
+		// (disk full, permissions) log it but keep uploading.
+		//
+		// fileHasher has been fed exactly cursor.Offset bytes at this point:
+		// each past iteration read chunkSize bytes from `in` (via the chunk
+		// buffer) which flowed through the TeeReader into fileHasher. Sum()
+		// is non-mutating, so subsequent Writes for this and later chunks
+		// continue the stream correctly.
+		if resumeActive {
+			if serr := saveResumeState(key, &resumeState{
+				Version:       resumeStateVersion,
+				SessionID:     sessionID,
+				Offset:        cursor.Offset,
+				SourceSize:    size,
+				SourceModTime: modTime,
+				DestPath:      destPath,
+				PrefixHashHex: hex.EncodeToString(fileHasher.Sum(nil)),
+			}); serr != nil {
+				fs.Debugf(o, "resume: save state failed: %v", serr)
+			}
 		}
 
 		chunk := readers.NewRepeatableLimitReaderBuffer(in, buf, chunkSize)
@@ -1996,12 +2149,33 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 						fs.Debugf(o, "%s: skipping bytes on retry to fix offset", what)
 					}
 				}
+				// If we resumed a cached session and the very first append is
+				// refused with not_found / closed, the session is gone for
+				// good. Bail without triggering the pacer's ~10 default
+				// low-level retries; the outer err handler below will delete
+				// the cache and return a retriable error so rclone's copy
+				// loop restarts from scratch.
+				if resumed && !firstAppendDone {
+					if uErr, ok := err.(files.UploadSessionAppendV2APIError); ok && uErr.EndpointError != nil {
+						switch uErr.EndpointError.Tag {
+						case files.UploadSessionAppendErrorNotFound,
+							files.UploadSessionAppendErrorClosed:
+							return false, err
+						}
+					}
+				}
 			}
 			return err != nil, err
 		})
 		if err != nil {
+			if resumed && !firstAppendDone {
+				fs.Debugf(o, "resume: first append of resumed session failed (%v); discarding cache and asking for retry", err)
+				_ = deleteResumeState(key)
+				return nil, fserrors.RetryError(fmt.Errorf("dropbox resume session unusable, retry from scratch: %w", err))
+			}
 			return nil, err
 		}
+		firstAppendDone = true
 		if appendArg.Close {
 			break
 		}
@@ -2024,9 +2198,19 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 		Cursor: &cursor,
 		Commit: commitInfo,
 	}
+	// Pass the Dropbox content hash of the full assembled file so the server
+	// rejects any mismatch between what we streamed and what it stored. This
+	// closes the window where a bad resume (e.g. prefix bytes from an older
+	// run disagree with the current source) could otherwise silently commit a
+	// Frankenstein file. Non-batched path only: batched commits are deferred
+	// through the batcher, which doesn't currently thread a content hash
+	// through — out of scope for this change.
+	if !batching {
+		args.ContentHash = hex.EncodeToString(fileHasher.Sum(nil))
+	}
 	// If we are batching then we should have written all the data now
 	// store the commit info now for a batch commit
-	if o.fs.batcher.Batching() {
+	if batching {
 		return o.fs.batcher.Commit(ctx, o.remote, args)
 	}
 
@@ -2039,7 +2223,23 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 		return err != nil, err
 	})
 	if err != nil {
+		// If the server says the assembled file doesn't match the hash we
+		// sent, the cached session is poisoned — delete it and surface a
+		// retriable error so the outer copy loop re-opens the source and
+		// starts a fresh upload on the next attempt.
+		if uErr, ok := err.(files.UploadSessionFinishAPIError); ok && uErr.EndpointError != nil &&
+			uErr.EndpointError.Tag == files.UploadSessionFinishErrorContentHashMismatch {
+			if resumeActive {
+				_ = deleteResumeState(key)
+			}
+			return nil, fserrors.RetryError(fmt.Errorf("dropbox upload: server reported content hash mismatch, retry from scratch: %w", err))
+		}
 		return nil, err
+	}
+	if resumeActive {
+		if derr := deleteResumeState(key); derr != nil {
+			fs.Debugf(o, "resume: cleanup after finish failed: %v", derr)
+		}
 	}
 	return entry, nil
 }

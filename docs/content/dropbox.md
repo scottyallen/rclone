@@ -200,6 +200,51 @@ with `--dropbox-batch-mode async` then do a final transfer with
 Note that there may be a pause when quitting rclone while rclone
 finishes up the last batch using this mode.
 
+### Resuming interrupted uploads {#resume-uploads}
+
+When `--dropbox-resume-uploads` is set, rclone persists the Dropbox
+upload session ID and current offset to its cache directory (usually
+`~/.cache/rclone/dropbox-resume/` on Linux, `~/Library/Caches/rclone/dropbox-resume/`
+on macOS) after each uploaded chunk. If a large upload is interrupted
+(crash, `Ctrl-C`, network loss, machine reboot), the next rclone run
+that targets the same destination with the same source continues from
+where it left off rather than starting from byte 0.
+
+A cache entry is keyed by destination path plus source size and
+modification time. Any change to those invalidates the entry, and
+rclone starts a fresh upload. Cache entries older than 7 days are
+swept on backend initialisation.
+
+To guard against content changes that preserve size and modification
+time (rare, but possible with in-place editors that don't bump mtime),
+rclone saves a Dropbox content hash of the already-uploaded prefix
+alongside each cache entry. On resume, it re-hashes the source prefix
+and refuses to reuse the session if the hashes disagree, restarting
+the upload from byte 0. In addition, rclone always sends the content
+hash of the full assembled file to `UploadSessionFinish`, so any
+server-side mismatch between what was uploaded and what rclone's
+source actually contains is caught before the file is committed.
+
+Dropbox upload sessions eventually expire when idle (the exact window
+isn't part of Dropbox's stable contract). If the server reports the
+session is gone when rclone tries to resume, rclone silently falls
+back to a fresh full upload.
+
+Known limitations:
+
+- This option has no effect while `--dropbox-batch-mode` is active.
+  Batched commits defer `UploadSessionFinish`, so mid-batch state
+  recovery is out of scope for now.
+- The progress bar counts bytes skipped on resume as "transferred",
+  so reported totals will exceed the actual wire usage. The final
+  file is still correct.
+- If you switch between `--inplace` and the default partial-file
+  upload mode between runs, the destination path the backend sees
+  changes, which invalidates the resume cache and starts a fresh
+  upload.
+- Two concurrent rclone processes uploading the same destination
+  path with resume enabled is unsupported.
+
 ### Exporting files
 
 Certain files in Dropbox are "exportable", such as Dropbox Paper
