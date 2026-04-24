@@ -81,7 +81,7 @@ func (d *digest) Sum(b []byte) []byte {
 	// A partial block is pending. Clone totalHash and flush the partial
 	// block hash into the clone, so the live totalHash keeps accumulating
 	// the in-progress block correctly when Write resumes.
-	clone := cloneSHA256(d.totalHash)
+	clone := d.cloneTotalHash()
 	// blockHash.Sum is non-mutating per the stdlib sha256 contract, so this
 	// reads the partial-block hash without disturbing d.blockHash.
 	partialBlockHash := d.blockHash.Sum(nil)
@@ -91,12 +91,14 @@ func (d *digest) Sum(b []byte) []byte {
 	return clone.Sum(b)
 }
 
-// cloneSHA256 duplicates a sha256 hasher's state by round-tripping through
-// encoding.BinaryMarshaler, which the stdlib sha256 digest implements. This
-// lets Sum() finalize a partial block into a copy of totalHash without
-// mutating the live hasher.
-func cloneSHA256(h hash.Hash) hash.Hash {
-	marshaler, ok := h.(encoding.BinaryMarshaler)
+// cloneTotalHash duplicates d.totalHash's sha256 state by round-tripping
+// through encoding.BinaryMarshaler, which the stdlib sha256 digest
+// implements. This lets Sum() finalize a partial block into a copy of
+// totalHash without mutating the live hasher. Scoped to d.totalHash so the
+// sha256 invariant (set by Reset) stays local to this file and callers can't
+// pass in an arbitrary hash.Hash that would be silently coerced to sha256.
+func (d *digest) cloneTotalHash() hash.Hash {
+	marshaler, ok := d.totalHash.(encoding.BinaryMarshaler)
 	if !ok {
 		panic("dbhash: sha256 hasher does not implement BinaryMarshaler")
 	}
