@@ -40,6 +40,7 @@ func (d *digest) writeBlockHash() {
 	if err != nil {
 		panic(hashReturnedError)
 	}
+	// reset counters for blockhash
 	d.n = 0
 	d.blockHash.Reset()
 }
@@ -61,6 +62,7 @@ func (d *digest) Write(p []byte) (n int, err error) {
 		}
 		d.n += toWrite
 		p = p[toWrite:]
+		// Accumulate the total hash
 		if d.n == bytesPerBlock {
 			d.writeBlockHash()
 		}
