@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	stdhash "hash"
 	"io"
 	"path"
 	"regexp"
@@ -2042,8 +2043,25 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 	// UploadSessionFinishArg.ContentHash so the server verifies the assembled
 	// file matches our source. dbhash supports multi-Sum, so a single instance
 	// serves both roles.
-	fileHasher := dbhash.New()
-	in := readers.NewCountingReader(io.TeeReader(in0, fileHasher))
+	//
+	// We only build the hasher (and tee the source through it) when its output
+	// will actually be consumed: non-batched chunked uploads with a known size.
+	// Batched uploads can't send a content hash via UploadSessionFinish (the
+	// batcher path is separate), and streaming uploads (size < 0) intentionally
+	// skip the finish hash to keep their pre-existing fire-and-forget retry
+	// semantics intact - on hash mismatch we'd return a RetryError that the
+	// outer copy loop can't honor for non-replayable sources (stdin pipe,
+	// one-shot HTTP body). resumeActive is a strict subset (it requires
+	// !batching && size > chunkSize > 0), so it's already covered.
+	needHash := !batching && size >= 0
+	var fileHasher stdhash.Hash
+	var in *readers.CountingReader
+	if needHash {
+		fileHasher = dbhash.New()
+		in = readers.NewCountingReader(io.TeeReader(in0, fileHasher))
+	} else {
+		in = readers.NewCountingReader(in0)
+	}
 
 	// When resuming, discard the already-uploaded prefix from the CountingReader
 	// (not in0 directly) so both in.BytesRead() and fileHasher reflect the real
@@ -2202,10 +2220,11 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 	// rejects any mismatch between what we streamed and what it stored. This
 	// closes the window where a bad resume (e.g. prefix bytes from an older
 	// run disagree with the current source) could otherwise silently commit a
-	// Frankenstein file. Non-batched path only: batched commits are deferred
-	// through the batcher, which doesn't currently thread a content hash
-	// through — out of scope for this change.
-	if !batching {
+	// Frankenstein file. Gated on needHash: batched commits are deferred
+	// through the batcher (which doesn't currently thread a content hash
+	// through), and streaming uploads (size < 0) skip the hash so we don't
+	// fail non-replayable sources on a server-side mismatch retry.
+	if needHash {
 		args.ContentHash = hex.EncodeToString(fileHasher.Sum(nil))
 	}
 	// If we are batching then we should have written all the data now
