@@ -325,6 +325,22 @@ Known limitation: the progress bar counts bytes skipped on resume as
 "transferred", so reported totals will exceed the actual wire usage.
 `,
 			Advanced: true,
+		}, {
+			Name:    "resume_cache_max_age",
+			Default: fs.Duration(7 * 24 * time.Hour),
+			Help: `How long to keep abandoned resume state files before sweeping them.
+
+Resume state for an upload that's never resumed (because the user gave
+up, or the destination changed, or rclone crashed and was never re-run)
+would otherwise accumulate in the cache directory. The sweep runs at
+backend init time and removes any state older than this duration.
+
+Set to 0 to disable the sweep entirely (state files persist until the
+upload completes successfully or is manually deleted from the cache).
+
+Has no effect when --dropbox-resume-uploads is off.
+`,
+			Advanced: true,
 		},
 		}...), defaultBatcherOptions.FsOptions("For full info see [the main docs](https://rclone.org/dropbox/#batch-mode)\n\n")...),
 	})
@@ -350,7 +366,8 @@ type Options struct {
 	ExportFormats  fs.CommaSepList      `config:"export_formats"`
 	SkipExports    bool                 `config:"skip_exports"`
 	ShowAllExports bool                 `config:"show_all_exports"`
-	ResumeUploads  bool                 `config:"resume_uploads"`
+	ResumeUploads     bool        `config:"resume_uploads"`
+	ResumeCacheMaxAge fs.Duration `config:"resume_cache_max_age"`
 }
 
 // Fs represents a remote dropbox server
@@ -496,8 +513,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, fmt.Errorf("dropbox: chunk size: %w", err)
 	}
 
-	if opt.ResumeUploads {
-		sweepResumeCache(7 * 24 * time.Hour)
+	if opt.ResumeUploads && opt.ResumeCacheMaxAge > 0 {
+		sweepResumeCache(time.Duration(opt.ResumeCacheMaxAge))
 	}
 
 	// Convert the old token if it exists.  The old token was just

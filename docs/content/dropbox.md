@@ -213,7 +213,10 @@ where it left off rather than starting from byte 0.
 A cache entry is keyed by destination path plus source size and
 modification time. Any change to those invalidates the entry, and
 rclone starts a fresh upload. Cache entries older than 7 days are
-swept on backend initialisation.
+swept on backend initialisation; this is configurable via
+`--dropbox-resume-cache-max-age`. Set to `0s` to disable the sweep
+entirely (useful if you have very long-running uploads that span
+multi-week outages).
 
 To guard against content changes that preserve size and modification
 time (rare, but possible with in-place editors that don't bump mtime),
