@@ -5,6 +5,8 @@ package dbhash
 
 import (
 	"crypto/sha256"
+	"encoding"
+	"fmt"
 	"hash"
 )
 
@@ -18,11 +20,9 @@ const (
 )
 
 type digest struct {
-	n           int // bytes written into blockHash so far
-	blockHash   hash.Hash
-	totalHash   hash.Hash
-	sumCalled   bool
-	writtenMore bool
+	n         int // bytes written into blockHash so far
+	blockHash hash.Hash
+	totalHash hash.Hash
 }
 
 // New returns a new hash.Hash computing the Dropbox checksum.
@@ -32,14 +32,14 @@ func New() hash.Hash {
 	return d
 }
 
-// writeBlockHash writes the current block hash into the total hash
+// writeBlockHash finalizes the current 4MB block's hash into totalHash and
+// resets the block state. Called from Write when a block fills up.
 func (d *digest) writeBlockHash() {
 	blockHash := d.blockHash.Sum(nil)
 	_, err := d.totalHash.Write(blockHash)
 	if err != nil {
 		panic(hashReturnedError)
 	}
-	// reset counters for blockhash
 	d.n = 0
 	d.blockHash.Reset()
 }
@@ -54,7 +54,6 @@ func (d *digest) writeBlockHash() {
 func (d *digest) Write(p []byte) (n int, err error) {
 	n = len(p)
 	for len(p) > 0 {
-		d.writtenMore = true
 		toWrite := min(bytesPerBlock-d.n, len(p))
 		_, err = d.blockHash.Write(p[:toWrite])
 		if err != nil {
@@ -62,7 +61,6 @@ func (d *digest) Write(p []byte) (n int, err error) {
 		}
 		d.n += toWrite
 		p = p[toWrite:]
-		// Accumulate the total hash
 		if d.n == bytesPerBlock {
 			d.writeBlockHash()
 		}
@@ -71,21 +69,48 @@ func (d *digest) Write(p []byte) (n int, err error) {
 }
 
 // Sum appends the current hash to b and returns the resulting slice.
-// It does not change the underlying hash state.
-//
-// TODO(ncw) Sum() can only be called once for this type of hash.
-// If you call Sum(), then Write() then Sum() it will result in
-// a panic.  Calling Write() then Sum(), then Sum() is OK.
+// Sum is non-mutating: further Writes continue the stream as if Sum had not
+// been called, and Sum may be called repeatedly.
 func (d *digest) Sum(b []byte) []byte {
-	if d.sumCalled && d.writtenMore {
-		panic("digest.Sum() called more than once")
+	if d.n == 0 {
+		// No partial block pending; totalHash already reflects every block.
+		return d.totalHash.Sum(b)
 	}
-	d.sumCalled = true
-	d.writtenMore = false
-	if d.n != 0 {
-		d.writeBlockHash()
+	// A partial block is pending. Clone totalHash and flush the partial
+	// block hash into the clone, so the live totalHash keeps accumulating
+	// the in-progress block correctly when Write resumes.
+	clone := cloneSHA256(d.totalHash)
+	// blockHash.Sum is non-mutating per the stdlib sha256 contract, so this
+	// reads the partial-block hash without disturbing d.blockHash.
+	partialBlockHash := d.blockHash.Sum(nil)
+	if _, err := clone.Write(partialBlockHash); err != nil {
+		panic(hashReturnedError)
 	}
-	return d.totalHash.Sum(b)
+	return clone.Sum(b)
+}
+
+// cloneSHA256 duplicates a sha256 hasher's state by round-tripping through
+// encoding.BinaryMarshaler, which the stdlib sha256 digest implements. This
+// lets Sum() finalize a partial block into a copy of totalHash without
+// mutating the live hasher.
+func cloneSHA256(h hash.Hash) hash.Hash {
+	marshaler, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		panic("dbhash: sha256 hasher does not implement BinaryMarshaler")
+	}
+	state, err := marshaler.MarshalBinary()
+	if err != nil {
+		panic(fmt.Errorf("dbhash: marshal sha256 state: %w", err))
+	}
+	clone := sha256.New()
+	unmarshaler, ok := clone.(encoding.BinaryUnmarshaler)
+	if !ok {
+		panic("dbhash: sha256 hasher does not implement BinaryUnmarshaler")
+	}
+	if err := unmarshaler.UnmarshalBinary(state); err != nil {
+		panic(fmt.Errorf("dbhash: unmarshal sha256 state: %w", err))
+	}
+	return clone
 }
 
 // Reset resets the Hash to its initial state.
@@ -93,8 +118,6 @@ func (d *digest) Reset() {
 	d.n = 0
 	d.totalHash = sha256.New()
 	d.blockHash = sha256.New()
-	d.sumCalled = false
-	d.writtenMore = false
 }
 
 // Size returns the number of bytes Sum will return.
