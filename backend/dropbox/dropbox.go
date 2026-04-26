@@ -2004,14 +2004,14 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 	var savedPrefixHashHex string
 	if resumeActive {
 		if state, ok, lerr := loadResumeState(key); lerr != nil {
-			fs.Debugf(o, "resume: ignoring unreadable state: %v", lerr)
+			fs.Logf(o, "Resume cache unreadable, ignoring (%v)", lerr)
 			_ = deleteResumeState(key)
 		} else if ok && fingerprintMatches(state, size, modTime, destPath) {
 			sessionID = state.SessionID
 			startOffset = state.Offset
 			savedPrefixHashHex = state.PrefixHashHex
 			resumed = true
-			fs.Debugf(o, "resume: reusing session %s at offset %d", sessionID, startOffset)
+			fs.Infof(o, "Resuming upload at offset %d (%d / %d bytes)", startOffset, startOffset, size)
 		} else if ok {
 			fs.Debugf(o, "resume: discarding state for changed source (saved size=%d modtime=%s, now size=%d modtime=%s)",
 				state.SourceSize, state.SourceModTime, size, modTime)
@@ -2076,7 +2076,7 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 		}
 		gotPrefixHashHex := hex.EncodeToString(fileHasher.Sum(nil))
 		if gotPrefixHashHex != savedPrefixHashHex {
-			fs.Debugf(o, "resume: prefix hash mismatch (saved=%s, recomputed=%s); source changed under preserved size+mtime",
+			fs.Logf(o, "Resume aborted: source content changed under preserved size+mtime (saved hash %s, recomputed %s); restarting upload from byte 0",
 				savedPrefixHashHex, gotPrefixHashHex)
 			_ = deleteResumeState(key)
 			return nil, fserrors.RetryError(fmt.Errorf("dropbox resume: source prefix hash mismatch, retry from scratch"))
@@ -2187,7 +2187,7 @@ func (o *Object) uploadChunked(ctx context.Context, in0 io.Reader, commitInfo *f
 		})
 		if err != nil {
 			if resumed && !firstAppendDone {
-				fs.Debugf(o, "resume: first append of resumed session failed (%v); discarding cache and asking for retry", err)
+				fs.Infof(o, "Resume aborted: cached session no longer valid (%v); restarting upload from byte 0", err)
 				_ = deleteResumeState(key)
 				return nil, fserrors.RetryError(fmt.Errorf("dropbox resume session unusable, retry from scratch: %w", err))
 			}
