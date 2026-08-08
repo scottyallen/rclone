@@ -1,6 +1,7 @@
 package dbhash_test
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"testing"
@@ -55,14 +56,56 @@ func TestHashChunk32k(t *testing.T)  { testChunk(t, 32*1024) }
 func TestHashChunk2048(t *testing.T) { testChunk(t, 2048) }
 func TestHashChunk2047(t *testing.T) { testChunk(t, 2047) }
 
-func TestSumCalledTwice(t *testing.T) {
+// TestMultiSum verifies that Sum can be called repeatedly, including with
+// Writes interleaved, and that each Sum reflects exactly the bytes written
+// so far, matching a single-pass hash of the same input.
+func TestMultiSum(t *testing.T) {
 	d := dbhash.New()
-	assert.NotPanics(t, func() { d.Sum(nil) })
-	d.Reset()
-	assert.NotPanics(t, func() { d.Sum(nil) })
-	assert.NotPanics(t, func() { d.Sum(nil) })
-	_, _ = d.Write([]byte{1})
-	assert.Panics(t, func() { d.Sum(nil) })
+
+	sumEmpty := hex.EncodeToString(d.Sum(nil))
+	assert.Equal(t, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", sumEmpty)
+	assert.Equal(t, sumEmpty, hex.EncodeToString(d.Sum(nil)), "Sum with no Writes must be stable")
+
+	_, _ = d.Write([]byte{'A'})
+	sumA := hex.EncodeToString(d.Sum(nil))
+	assert.Equal(t, "1cd6ef71e6e0ff46ad2609d403dc3fee244417089aa4461245a4e4fe23a55e42", sumA)
+	assert.Equal(t, sumA, hex.EncodeToString(d.Sum(nil)), "repeated Sum without Write must be stable")
+
+	_, _ = d.Write([]byte("BCDEFG"))
+	interleaved := hex.EncodeToString(d.Sum(nil))
+
+	d2 := dbhash.New()
+	_, _ = d2.Write([]byte("ABCDEFG"))
+	expected := hex.EncodeToString(d2.Sum(nil))
+	assert.Equal(t, expected, interleaved, "interleaved Write/Sum/Write/Sum must match single-pass hash")
+}
+
+// TestMultiSumAcrossBlockBoundary exercises the partial-block-clone path by
+// Sum-ing at three points that each straddle a 4MB block boundary differently:
+// before the boundary (partial block pending), just after it (clean boundary),
+// and mid-way through the next block. Each Sum must match a fresh single-pass
+// hash of the same cumulative prefix.
+func TestMultiSumAcrossBlockBoundary(t *testing.T) {
+	const block = 4 * 1024 * 1024
+	first := bytes.Repeat([]byte{'A'}, block-100)
+	second := bytes.Repeat([]byte{'B'}, 200)
+	third := bytes.Repeat([]byte{'C'}, block)
+
+	expect := func(parts ...[]byte) string {
+		h := dbhash.New()
+		for _, p := range parts {
+			_, _ = h.Write(p)
+		}
+		return hex.EncodeToString(h.Sum(nil))
+	}
+
+	d := dbhash.New()
+	_, _ = d.Write(first)
+	assert.Equal(t, expect(first), hex.EncodeToString(d.Sum(nil)), "partial-block Sum before 4MB boundary")
+	_, _ = d.Write(second)
+	assert.Equal(t, expect(first, second), hex.EncodeToString(d.Sum(nil)), "partial-block Sum after crossing boundary")
+	_, _ = d.Write(third)
+	assert.Equal(t, expect(first, second, third), hex.EncodeToString(d.Sum(nil)), "partial-block Sum deep into next block")
 }
 
 func TestSize(t *testing.T) {
